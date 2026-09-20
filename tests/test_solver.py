@@ -4,11 +4,13 @@ import pytest
 from app.solver import SourceData, solve_blend, solve_contingency
 
 
-def src(id, max_volume, cost, ca=50.0, mg=10.0, alk=100.0, batch_size=None):
+def src(id, max_volume, cost, ca=50.0, mg=10.0, alk=100.0, batch_size=None,
+        minimum_run_volume=None):
     return SourceData(
         id=id, max_volume=max_volume, cost=cost,
         calcium=ca, magnesium=mg, alkalinity=alk,
         batch_size=batch_size,
+        minimum_run_volume=minimum_run_volume,
     )
 
 
@@ -453,3 +455,260 @@ def test_contingency_batch_cap_cuts_lattice_volume():
     )
     assert cont.status == "infeasible"
     assert cont.achievable_ranges["volume"]["max"] == pytest.approx(600.0, abs=1e-6)
+
+# --------------------------------------------------------------------------- #
+# minimum_run_volume (commissioning) semantics
+# --------------------------------------------------------------------------- #
+
+def test_unset_minimum_run_keeps_small_usages():
+    # Identical sources, no thresholds: the lex-min split may use a tiny
+    # fraction of the first source.
+    out = solve_blend([src("A", 100, 1.0), src("B", 100, 1.0)], 33.5, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([0.0, 33.5], abs=1e-6)
+
+
+def test_minimum_run_forces_zero_or_threshold():
+    # A ca 100 cost 1 with a 300 m3 commissioning threshold, B ca 20 cost 2,
+    # V=500, calcium window [15, 67].  The continuous optimum is A=250,
+    # B=250 (calcium 60, cost 750) — but A=250 sits in the forbidden band
+    # (0, 300).  Enabling A needs A >= 300, which gives calcium >= 68 and
+    # violates the window, so A must be shut off entirely: B=500, calcium 20,
+    # cost 1000.  This is a single-MIP result, not post-hoc trimming.
+    sources = [
+        src("A", 500, 1.0, ca=100.0, minimum_run_volume=300.0),
+        src("B", 500, 2.0, ca=20.0),
+    ]
+    out = solve_blend(sources, 500, {"calcium": (15.0, 67.0)})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([0.0, 500.0], abs=1e-6)
+    assert out.total_cost == pytest.approx(1000.0, abs=1e-6)
+
+
+def test_minimum_run_allows_full_threshold_usage():
+    # Same setup, V=700: using A=500 (>= 300) + B=200 costs 900 and is the
+    # MIP optimum — no post-hoc rounding is involved.
+    sources = [
+        src("A", 500, 1.0, minimum_run_volume=300.0),
+        src("B", 500, 2.0),
+    ]
+    out = solve_blend(sources, 700, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([500.0, 200.0], abs=1e-6)
+    assert out.total_cost == pytest.approx(900.0, abs=1e-6)
+
+
+def test_minimum_run_lexicographic_tie_break():
+    # Identical sources A, B (min-run 300), C continuous; V=100.  Without
+    # thresholds the lex-min is A=0, B=40, C=60; B=40 is forbidden, so the
+    # lex-min feasible allocation drops B as well: A=0, B=0, C=100.
+    sources = [
+        src("C", 100, 1.0),
+        src("A", 100, 1.0, minimum_run_volume=300.0),
+        src("B", 100, 1.0, minimum_run_volume=300.0),
+    ]
+    out = solve_blend(sources, 100, {})
+    assert out.status == "optimal"
+    vols = dict(zip(["A", "B", "C"], out.volumes))
+    assert vols["A"] == pytest.approx(0.0, abs=1e-6)
+    assert vols["B"] == pytest.approx(0.0, abs=1e-6)
+    assert vols["C"] == pytest.approx(100.0, abs=1e-6)
+
+
+def test_minimum_run_threshold_larger_than_cap_means_off_only():
+    # Threshold above the source cap: enabling is impossible, so the source
+    # can only be off.  Here every allocation needs water from B, making the
+    # problem infeasible.
+    sources = [
+        src("A", 50, 1.0, minimum_run_volume=100.0),
+        src("B", 400, 2.0),
+    ]
+    out = solve_blend(sources, 500, {})
+    assert out.status == "infeasible"
+    assert out.achievable_ranges["volume"]["max"] == pytest.approx(400.0)
+
+
+def test_minimum_active_sources_forces_second_source():
+    # A cost 1 min-run 300, B cost 2 min-run 300, C cost 3 continuous;
+    # V=500, K=2.  The cheap single-source plan A=500 (cost 500) violates
+    # K=2, and any two enabled threshold sources draw at least 600 > 500, so
+    # the problem is infeasible.
+    sources = [
+        src("A", 500, 1.0, minimum_run_volume=300.0),
+        src("B", 500, 2.0, minimum_run_volume=300.0),
+        src("C", 500, 3.0),
+    ]
+    out = solve_blend(sources, 500, {}, minimum_active_sources=2)
+    assert out.status == "infeasible"
+    entry = out.achievable_ranges["active_sources"]
+    assert entry["requested"] == 2 and entry["available"] == 2
+    # no positive volume is attainable under the count constraint; the
+    # indicator ranges are therefore not projected
+    assert out.achievable_ranges["volume"]["max"] == pytest.approx(0.0)
+
+
+def test_minimum_active_sources_feasible_pair():
+    # V=700, K=2 with A cost 1 (min 300) and B cost 2 (min 300): the MIP
+    # enables both and gives A=400, B=300 (cost 1000), cheaper than the
+    # lex tie alternatives A=300,B=400 (cost 1100).
+    sources = [
+        src("A", 700, 1.0, minimum_run_volume=300.0),
+        src("B", 700, 2.0, minimum_run_volume=300.0),
+    ]
+    out = solve_blend(sources, 700, {}, minimum_active_sources=2)
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([400.0, 300.0], abs=1e-6)
+    assert out.total_cost == pytest.approx(1000.0, abs=1e-6)
+
+
+def test_minimum_active_sources_counts_only_threshold_sources():
+    # Only A declares a threshold; continuous B never counts toward K=2,
+    # even though B is used.  Feasible set is empty.
+    sources = [
+        src("A", 500, 1.0, minimum_run_volume=100.0),
+        src("B", 500, 2.0),
+    ]
+    out = solve_blend(sources, 500, {}, minimum_active_sources=2)
+    assert out.status == "infeasible"
+    entry = out.achievable_ranges["active_sources"]
+    assert entry == {"requested": 2, "available": 1}
+    assert "minimum_active_sources=2" in out.message
+
+
+def test_minimum_active_sources_zero_is_unconstrained():
+    # K=0 keeps the thresholds enforced but requires nobody to be enabled;
+    # the calcium window [15, 67] forces cheap A below its 300 threshold, so
+    # the MIP shuts A off (same as without K).
+    sources = [
+        src("A", 500, 1.0, ca=100.0, minimum_run_volume=300.0),
+        src("B", 500, 2.0, ca=20.0),
+    ]
+    out = solve_blend(
+        sources, 500, {"calcium": (15.0, 67.0)}, minimum_active_sources=0
+    )
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([0.0, 500.0], abs=1e-6)
+
+
+def test_minimum_run_with_batch_size_uses_lattice_ceiling():
+    # B batches of 300 and a threshold of 200: when enabled, at least
+    # ceil(200/300)=1 batch (300) must flow.  V=500, B cheap: unconstrained
+    # MIP picks B=300 anyway, so optimum is A=200, B=300.
+    sources = [
+        src("A", 1000, 2.0),
+        src("B", 1000, 1.0, batch_size=300.0, minimum_run_volume=200.0),
+    ]
+    out = solve_blend(sources, 500, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([200.0, 300.0], abs=1e-6)
+
+    # V=200 instead: B=300 alone exceeds the target, so B must stay off and
+    # A covers all 200 (cost 400 vs. infeasible batch mix).
+    out2 = solve_blend(sources, 200, {})
+    assert out2.status == "optimal"
+    assert out2.volumes == pytest.approx([200.0, 0.0], abs=1e-6)
+
+
+def test_minimum_run_shapes_achievable_ranges():
+    # A ca 100 cost 1 (min-run 400, cap 500), B ca 20 cost 2 (cap 300),
+    # V=500.  A cannot stay off because B alone supplies at most 300, so any
+    # feasible allocation draws A >= 400; the achievable calcium band is
+    # [84, 100] rather than the continuous [20, 100].  Demanding calcium
+    # <= 60 is infeasible and the reported range must honor the threshold.
+    sources = [
+        src("A", 500, 1.0, ca=100.0, minimum_run_volume=400.0),
+        src("B", 300, 2.0, ca=20.0),
+    ]
+    out = solve_blend(sources, 500, {"calcium": (10.0, 60.0)})
+    assert out.status == "infeasible"
+    ca = out.achievable_ranges["calcium"]
+    assert ca["min"] == pytest.approx(84.0, abs=1e-6)
+    assert ca["max"] == pytest.approx(100.0, abs=1e-6)
+    assert "calcium" in out.message
+
+
+def test_minimum_run_makes_target_unattainable():
+    # Both sources batch-free but each has a 300 threshold and a 400 cap:
+    # each usage is 0 or in [300, 400], so attainable totals are 0,
+    # [300, 400] or [600, 800].  V=500 lies in the gap; the largest
+    # attainable volume not above it is 400.
+    sources = [
+        src("A", 400, 1.0, minimum_run_volume=300.0),
+        src("B", 400, 2.0, minimum_run_volume=300.0),
+    ]
+    out = solve_blend(sources, 500, {})
+    assert out.status == "infeasible"
+    assert out.achievable_ranges["volume"]["max"] == pytest.approx(400.0)
+    assert "minimum-run" in out.message
+
+
+# --------------------------------------------------------------------------- #
+# minimum-run aware supply-reduction contingencies
+# --------------------------------------------------------------------------- #
+
+def test_contingency_preserves_minimum_run():
+    # Original A=500 (>= 300 threshold), B=200, V=700; B is continuous with
+    # cap 1000.  Cut A's cap to 250: A cannot run below 300, so it must shut
+    # off entirely and B takes all 700.
+    sources = [
+        src("A", 500, 1.0, minimum_run_volume=300.0),
+        src("B", 1000, 2.0),
+    ]
+    cont = solve_contingency(
+        sources, 700, {}, {"A": 500.0, "B": 200.0}, {"A": 250.0},
+    )
+    assert cont.status == "optimal"
+    assert cont.volumes == pytest.approx([0.0, 700.0], abs=1e-6)
+    assert cont.total_adjustment == pytest.approx(1000.0, abs=1e-6)
+    assert cont.total_cost == pytest.approx(1400.0, abs=1e-6)
+
+
+def test_contingency_minimum_active_sources_forces_reshuffle():
+    # A cost 1 (min 300), B cost 2 (min 300), V=700, K=2; original
+    # A=400, B=300.  Cut A to 350: to keep K=2 both must stay enabled with
+    # A in [300, 350]; min-change keeps A=350 and moves 50 to B -> (350, 350).
+    sources = [
+        src("A", 700, 1.0, minimum_run_volume=300.0),
+        src("B", 700, 2.0, minimum_run_volume=300.0),
+    ]
+    cont = solve_contingency(
+        sources, 700, {}, {"A": 400.0, "B": 300.0}, {"A": 350.0},
+        minimum_active_sources=2,
+    )
+    assert cont.status == "optimal"
+    assert cont.volumes == pytest.approx([350.0, 350.0], abs=1e-6)
+    assert cont.total_adjustment == pytest.approx(100.0, abs=1e-6)
+
+
+def test_contingency_infeasible_minimum_active_after_cut():
+    # K=2, A and B thresholds 300; cutting A to 100 disables it for good,
+    # leaving only one activatable threshold source -> infeasible, with the
+    # ranges computed on the SAME constrained set.
+    sources = [
+        src("A", 500, 1.0, minimum_run_volume=300.0),
+        src("B", 500, 2.0, minimum_run_volume=300.0),
+    ]
+    cont = solve_contingency(
+        sources, 700, {}, {"A": 400.0, "B": 300.0}, {"A": 100.0},
+        minimum_active_sources=2,
+    )
+    assert cont.status == "infeasible"
+    entry = cont.achievable_ranges["active_sources"]
+    assert entry == {"requested": 2, "available": 1}
+    assert "minimum_active_sources=2" in cont.message
+
+
+def test_contingency_minimum_run_with_batch_lattice():
+    # B batches of 300 with threshold 200 (=> enabled means >= 1 batch);
+    # original A=200, B=300 on V=500.  Cut B to 150: no batch fits, so B
+    # must be off and A (continuous) takes all 500.
+    sources = [
+        src("A", 1000, 2.0),
+        src("B", 1000, 1.0, batch_size=300.0, minimum_run_volume=200.0),
+    ]
+    cont = solve_contingency(
+        sources, 500, {}, {"A": 200.0, "B": 300.0}, {"B": 150.0},
+    )
+    assert cont.status == "optimal"
+    assert cont.volumes == pytest.approx([500.0, 0.0], abs=1e-6)
+    assert cont.deltas == pytest.approx([300.0, -300.0], abs=1e-6)

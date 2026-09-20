@@ -38,15 +38,25 @@ class Source(BaseModel):
             "and not exceed max_volume; when omitted the volume is continuous"
         ),
     )
+    minimum_run_volume: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "optional commissioning threshold in m3; when set, the volume "
+            "drawn from this source must be either 0 or at least this value "
+            "(a binary enable variable couples it to the usage in the same "
+            "MIP); when omitted any non-negative volume up to max_volume is "
+            "allowed"
+        ),
+    )
 
     @field_validator("id", mode="before")
     @classmethod
     def _coerce_id(cls, v: Any) -> str:
         return str(v).strip()
 
-    @field_validator("batch_size", mode="before")
-    @classmethod
-    def _coerce_batch_size(cls, v: Any) -> Any:
+    @staticmethod
+    def _finite_positive(v: Any, field: str) -> Any:
         """Reject NaN/+inf/-inf explicitly and non-finite numeric strings.
 
         Pydantic's ``gt=0`` already excludes negatives, zero and null/non
@@ -55,14 +65,24 @@ class Source(BaseModel):
         if v is None:
             return None
         if isinstance(v, bool):
-            raise ValueError("batch_size must be a finite positive number")
+            raise ValueError(f"{field} must be a finite positive number")
         try:
             f = float(v)
         except (TypeError, ValueError):
             return v  # let Pydantic produce its standard type error
         if not math.isfinite(f):
-            raise ValueError("batch_size must be a finite positive number")
+            raise ValueError(f"{field} must be a finite positive number")
         return f
+
+    @field_validator("batch_size", mode="before")
+    @classmethod
+    def _coerce_batch_size(cls, v: Any) -> Any:
+        return cls._finite_positive(v, "batch_size")
+
+    @field_validator("minimum_run_volume", mode="before")
+    @classmethod
+    def _coerce_minimum_run_volume(cls, v: Any) -> Any:
+        return cls._finite_positive(v, "minimum_run_volume")
 
 
 class BlendRequest(BaseModel):
@@ -73,6 +93,15 @@ class BlendRequest(BaseModel):
     magnesium: Optional[IndicatorRange] = None
     alkalinity: Optional[IndicatorRange] = None
     sources: List[Source] = Field(..., min_length=2, max_length=6)
+    minimum_active_sources: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "optional minimum number of sources that must be active, i.e. "
+            "drawn at their minimum_run_volume or more; only sources that "
+            "declare minimum_run_volume count toward it"
+        ),
+    )
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "BlendRequest":
@@ -80,6 +109,14 @@ class BlendRequest(BaseModel):
         if len(set(ids)) != len(ids):
             raise ValueError("source ids must be unique")
         return self
+
+    @field_validator("minimum_active_sources", mode="before")
+    @classmethod
+    def _coerce_minimum_active_sources(cls, v: Any) -> Any:
+        # Booleans are ints in Python; reject them like the other numeric gates.
+        if v is not None and isinstance(v, bool):
+            raise ValueError("minimum_active_sources must be a non-negative integer")
+        return v
 
 
 class PlanCreateRequest(BlendRequest):
