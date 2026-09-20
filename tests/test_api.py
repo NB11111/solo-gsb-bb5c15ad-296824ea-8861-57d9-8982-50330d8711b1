@@ -525,3 +525,251 @@ def test_contingency_batch_infeasible(client):
     body = r.json()
     assert body["status"] == "infeasible"
     assert body["achievable_ranges"]["calcium"]["max"] == pytest.approx(20.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# minimum_run_volume / minimum_active_sources end-to-end
+# --------------------------------------------------------------------------- #
+
+def _minimum_run_request(idempotency_key=None, minimum_active_sources=None,
+                         gate_w1=None, gate_w2=800, window=None):
+    payload = {
+        "target_volume": 1000,
+        "calcium": {"min": 40, "max": 100} if window is None else window,
+        "sources": [
+            {"id": "W1", "max_volume": 1000, "cost": 2.0, "calcium": 100,
+             "magnesium": 10, "alkalinity": 100,
+             **({"minimum_run_volume": gate_w1} if gate_w1 is not None else {})},
+            {"id": "W2", "max_volume": 1000, "cost": 1.0, "calcium": 20,
+             "magnesium": 10, "alkalinity": 100,
+             **({"minimum_run_volume": gate_w2} if gate_w2 is not None else {})},
+        ],
+    }
+    if minimum_active_sources is not None:
+        payload["minimum_active_sources"] = minimum_active_sources
+    if idempotency_key is not None:
+        payload["idempotency_key"] = idempotency_key
+    return payload
+
+
+def test_solve_minimum_run_forces_zero(client):
+    # Unconstrained calcium optimum is W1=250, W2=750 (calcium 40); W2's gate
+    # of 800 forbids that band, so the MIP returns W1=1000, W2=0.
+    r = client.post(
+        "/api/v1/blends/solve", json=_minimum_run_request(gate_w1=None)
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "optimal"
+    blend = {a["source_id"]: a["volume"] for a in body["blend"]}
+    assert blend["W1"] == pytest.approx(1000.0, abs=1e-6)
+    assert blend["W2"] == pytest.approx(0.0, abs=1e-6)
+    assert body["total_cost"] == pytest.approx(2000.0, abs=1e-6)
+
+
+def test_solve_minimum_active_sources(client):
+    # All three sources gated at 40, caps (A 100, B 100, C 60), min_active=2:
+    # lex-min cost optimum is A=0, B=40, C=60.
+    payload = {
+        "target_volume": 100,
+        "minimum_active_sources": 2,
+        "sources": [
+            {"id": "A", "max_volume": 100, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+            {"id": "B", "max_volume": 100, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+            {"id": "C", "max_volume": 60, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+        ],
+    }
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 200
+    blend = {a["source_id"]: a["volume"] for a in r.json()["blend"]}
+    assert blend["A"] == pytest.approx(0.0, abs=1e-6)
+    assert blend["B"] == pytest.approx(40.0, abs=1e-6)
+    assert blend["C"] == pytest.approx(60.0, abs=1e-6)
+
+
+def test_minimum_active_sources_too_large_422(client):
+    payload = {
+        "target_volume": 100,
+        "minimum_active_sources": 2,
+        "sources": [
+            {"id": "A", "max_volume": 100, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+            {"id": "B", "max_volume": 100, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100},
+        ],
+    }
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 422
+    assert "minimum_active_sources" in r.text
+
+
+def test_minimum_active_sources_without_gates_422(client):
+    payload = make_request()
+    payload["minimum_active_sources"] = 1
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5, "abc", True, False])
+def test_minimum_run_volume_validation(client, bad):
+    payload = make_request()
+    payload["sources"][0]["minimum_run_volume"] = bad
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, "abc", True, False])
+def test_minimum_active_sources_validation(client, bad):
+    payload = _minimum_run_request()
+    payload["minimum_active_sources"] = bad
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_minimum_run_volume_must_be_finite(client, token):
+    raw = (
+        '{"target_volume": 1000, "sources": ['
+        '{"id": "W1", "max_volume": 600, "cost": 1.0, "calcium": 100,'
+        ' "magnesium": 30, "alkalinity": 250, "minimum_run_volume": ' + token + '},'
+        '{"id": "W2", "max_volume": 800, "cost": 2.0, "calcium": 20,'
+        ' "magnesium": 5, "alkalinity": 80}'
+        ']}'
+    )
+    r = client.post(
+        "/api/v1/blends/solve", content=raw,
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_minimum_run_volume_null_or_string(client):
+    payload = make_request()
+    payload["sources"][0]["minimum_run_volume"] = None
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 200
+    payload["sources"][0]["minimum_run_volume"] = "250"
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 200
+
+
+def test_minimum_run_plan_persisted_and_replayed(client):
+    payload = _minimum_run_request(idempotency_key="run-plan-1")
+    r1 = client.post("/api/v1/blends", json=payload)
+    assert r1.status_code == 201
+    assert r1.json()["status"] == "optimal"
+    r2 = client.post("/api/v1/blends", json=payload)
+    assert r2.status_code == 200
+    assert r2.headers.get("x-idempotent-replay") == "true"
+    assert r2.json() == r1.json()
+    g = client.get(f"/api/v1/blends/{r1.json()['plan_id']}")
+    assert g.status_code == 200
+    assert g.json() == r1.json()
+
+
+def test_minimum_run_part_of_idempotency_fingerprint(client):
+    with_gate = _minimum_run_request(idempotency_key="run-fp")
+    r1 = client.post("/api/v1/blends", json=with_gate)
+    assert r1.status_code == 201
+    # same key, gate dropped on W2: different request -> conflict
+    without_gate = _minimum_run_request(idempotency_key="run-fp")
+    without_gate["sources"][1].pop("minimum_run_volume")
+    r2 = client.post("/api/v1/blends", json=without_gate)
+    assert r2.status_code == 409
+
+
+def test_minimum_active_count_part_of_idempotency_fingerprint(client):
+    with_count = _minimum_run_request(
+        idempotency_key="run-fp-count", gate_w1=40, gate_w2=40,
+        minimum_active_sources=1,
+    )
+    r1 = client.post("/api/v1/blends", json=with_count)
+    assert r1.status_code == 201
+    without_count = dict(with_count)
+    without_count.pop("minimum_active_sources")
+    r2 = client.post("/api/v1/blends", json=without_count)
+    assert r2.status_code == 409
+
+
+def test_minimum_run_infeasible_uses_same_mip_ranges(client):
+    # W2 gated at 800; calcium window [40,60] is only reachable with W2 in
+    # [500,750], which the gate forbids.  The reported range must honor the
+    # gate (min 20 at B=1000, max 100 at B=0), not a post-hoc prune.
+    r = client.post(
+        "/api/v1/blends/solve",
+        json=_minimum_run_request(gate_w1=None, window={"min": 40, "max": 60}),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "infeasible"
+    ca = body["achievable_ranges"]["calcium"]
+    assert ca["min"] == pytest.approx(20.0, abs=1e-6)
+    assert ca["max"] == pytest.approx(100.0, abs=1e-6)
+    assert "source-activation" in body["message"]
+
+
+def test_infeasible_minimum_run_plan_is_persisted(client):
+    payload = _minimum_run_request(
+        idempotency_key="run-infeasible", gate_w1=None,
+        window={"min": 40, "max": 60},
+    )
+    r = client.post("/api/v1/blends", json=payload)
+    assert r.status_code == 201
+    assert r.json()["status"] == "infeasible"
+    g = client.get(f"/api/v1/blends/{r.json()['plan_id']}")
+    assert g.status_code == 200
+    assert g.json()["status"] == "infeasible"
+    assert g.json()["achievable_ranges"]["calcium"]["max"] == pytest.approx(100.0)
+
+
+def test_contingency_preserves_minimum_run(client):
+    # Saved plan (A=0, B=40, C=60), gates 40 on all three, min_active=2.
+    # Cut C to 20: it deactivates; A must come on at >=40 -> (40, 60, 0),
+    # total change 40 + 20 + 60 = 120.
+    payload = {
+        "target_volume": 100,
+        "minimum_active_sources": 2,
+        "idempotency_key": "run-cont-1",
+        "sources": [
+            {"id": "A", "max_volume": 100, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+            {"id": "B", "max_volume": 100, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+            {"id": "C", "max_volume": 60, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "minimum_run_volume": 40},
+        ],
+    }
+    plan = client.post("/api/v1/blends", json=payload).json()
+    assert plan["status"] == "optimal"
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency", json={"C": 20}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "optimal"
+    blend = {a["source_id"]: a["new_volume"] for a in body["blend"]}
+    assert blend["A"] == pytest.approx(40.0, abs=1e-6)
+    assert blend["B"] == pytest.approx(60.0, abs=1e-6)
+    assert blend["C"] == pytest.approx(0.0, abs=1e-6)
+    # change: A 0->40, B 40->60, C 60->0
+    assert body["total_adjustment"] == pytest.approx(120.0, abs=1e-6)
+
+
+def test_contingency_minimum_run_infeasible(client):
+    # Saved (W1=1000, W2=0) under calcium [40,100] with W2 gated at 800.
+    # Cut W1 to 800: the remaining volume would need W2 in (0,200], which the
+    # gate forbids; at W2>=800 calcium drops below 40 -> infeasible, with the
+    # achievable calcium maximum of 36 from the same constrained set.
+    plan = client.post(
+        "/api/v1/blends",
+        json=_minimum_run_request(idempotency_key="run-cont-inf"),
+    ).json()
+    assert plan["status"] == "optimal"
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency", json={"W1": 800}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "infeasible"
+    assert body["achievable_ranges"]["calcium"]["max"] == pytest.approx(36.0, abs=1e-6)
+    assert "calcium" in body["message"]

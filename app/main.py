@@ -37,11 +37,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Drinking Water Blending API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "最低成本饮用水混配优化：在满足钙 / 镁 / 碱度区间与水源供给上限的"
         "前提下最小化总成本；水源可设置 batch_size（批次体积），设置后用量"
-        "必须为其非负整数倍，连续与批次水源在同一混合整数模型中求解；"
+        "必须为其非负整数倍，连续与批次水源在同一混合整数模型中求解；水源"
+        "还可设置 minimum_run_volume（投运门槛），由二元启用变量保证用量"
+        "为 0 或不低于该门槛，请求可用 minimum_active_sources 要求至少若干"
+        "个带门槛水源达到门槛，二者与连续/批次用量联立在同一 MIP 中求解；"
         "成本并列时取按水源 ID 排序后用量向量字典序最小者；不可行时返回"
         "各指标在同一混合整数可行集上的可达范围。"
     ),
@@ -103,6 +106,7 @@ def _source_data(req: BlendRequest) -> List[SourceData]:
                 magnesium=s.magnesium,
                 alkalinity=s.alkalinity,
                 batch_size=s.batch_size,
+                minimum_run_volume=s.minimum_run_volume,
             )
             for s in req.sources
         ),
@@ -122,8 +126,9 @@ def _limits_from_request(req: BlendRequest) -> Dict[str, Tuple[float, float]]:
 def _solve(req: BlendRequest) -> Tuple[List[SourceData], Any]:
     sources = _source_data(req)
     limits = _limits_from_request(req)
+    min_active = req.minimum_active_sources or 0
     try:
-        result = solve_blend(sources, req.target_volume, limits)
+        result = solve_blend(sources, req.target_volume, limits, min_active=min_active)
     except RuntimeError as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=str(exc))
     return sources, result
@@ -211,7 +216,7 @@ def _utcnow() -> str:
 def root() -> Dict[str, str]:
     return {
         "service": "drinking-water-blending-api",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "docs": "/docs",
         "health": "/health",
     }
@@ -299,11 +304,12 @@ def plan_contingency(plan_id: int, reductions: Dict[str, float]) -> JSONResponse
     At least one source must be listed, each new cap must satisfy
     ``0 <= new_cap <= original max_volume``, and sources not listed keep
     their original cap.  The target volume, indicator windows, water
-    quality (source concentrations) and costs are taken from the stored
-    request.  Among feasible allocations the service first minimizes the
-    total absolute volume change versus the saved blend, then the total
-    cost, and finally takes the id-sorted usage-vector lexicographic
-    minimum.
+    quality (source concentrations), costs, batch sizes and
+    minimum-run-volume activations (including minimum_active_sources) are
+    taken from the stored request.  Among feasible allocations the service
+    first minimizes the total absolute volume change versus the saved
+    blend, then the total cost, and finally takes the id-sorted
+    usage-vector lexicographic minimum.
 
     The contingency result is neither saved nor does it modify the
     original plan.  Infeasibility under the new caps is reported with
@@ -371,6 +377,7 @@ def plan_contingency(plan_id: int, reductions: Dict[str, float]) -> JSONResponse
             _limits_from_request(req),
             original,
             {sid: float(cap) for sid, cap in reductions.items()},
+            min_active=req.minimum_active_sources or 0,
         )
     except RuntimeError as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=str(exc))

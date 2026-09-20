@@ -4,11 +4,12 @@ import pytest
 from app.solver import SourceData, solve_blend, solve_contingency
 
 
-def src(id, max_volume, cost, ca=50.0, mg=10.0, alk=100.0, batch_size=None):
+def src(id, max_volume, cost, ca=50.0, mg=10.0, alk=100.0, batch_size=None,
+        minimum_run_volume=None):
     return SourceData(
         id=id, max_volume=max_volume, cost=cost,
         calcium=ca, magnesium=mg, alkalinity=alk,
-        batch_size=batch_size,
+        batch_size=batch_size, minimum_run_volume=minimum_run_volume,
     )
 
 
@@ -453,3 +454,219 @@ def test_contingency_batch_cap_cuts_lattice_volume():
     )
     assert cont.status == "infeasible"
     assert cont.achievable_ranges["volume"]["max"] == pytest.approx(600.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# minimum_run_volume / minimum_active_sources (binary enable variables)
+# --------------------------------------------------------------------------- #
+
+def test_minimum_run_unset_does_not_change_anything():
+    out = solve_blend(
+        [src("A", 100, 1.0, minimum_run_volume=None),
+         src("B", 100, 1.0, minimum_run_volume=None)],
+        33.5, {},
+    )
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([0.0, 33.5], abs=1e-6)
+
+
+def test_minimum_run_forces_cheap_source_to_zero():
+    # Unconstrained calcium optimum [40, 100] is A=250, B=750 (calcium 40).
+    # B's gate of 800 forbids the band (0, 800); at B>=800 calcium drops below
+    # 40, so the only feasible optimum is B=0, A=1000 — never B=750.
+    sources = [
+        src("A", 1000, 2.0, ca=100.0),
+        src("B", 1000, 1.0, ca=20.0, minimum_run_volume=800.0),
+    ]
+    out = solve_blend(sources, 1000, {"calcium": (40.0, 100.0)})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([1000.0, 0.0], abs=1e-6)
+    assert out.total_cost == pytest.approx(2000.0, abs=1e-6)
+
+
+def test_minimum_run_allows_zero_and_above_threshold():
+    # Without a window the cheapest gated source B is simply drained at 100.
+    sources = [
+        src("A", 1000, 2.0),
+        src("B", 1000, 1.0, minimum_run_volume=300.0),
+    ]
+    out = solve_blend(sources, 1000, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([0.0, 1000.0], abs=1e-6)
+
+    # V = 100 < gate 300: B cannot be partially used, so A covers everything.
+    small = solve_blend(sources, 100, {})
+    assert small.status == "optimal"
+    assert small.volumes == pytest.approx([100.0, 0.0], abs=1e-6)
+
+
+def test_minimum_run_never_yields_interior_volume():
+    # Whatever the optimum, a gated source volume is either 0 or >= its gate.
+    sources = [
+        src("A", 1000, 2.0, ca=100.0),
+        src("B", 1000, 1.0, ca=20.0, minimum_run_volume=250.0),
+        src("C", 1000, 3.0, ca=60.0, minimum_run_volume=150.0),
+    ]
+    for lo, hi in [(0.0, 100.0), (30.0, 80.0), (55.0, 95.0)]:
+        out = solve_blend(sources, 1000, {"calcium": (lo, hi)})
+        assert out.status == "optimal"
+        v_b, v_c = out.volumes[1], out.volumes[2]
+        assert v_b == pytest.approx(0.0, abs=1e-6) or v_b >= 250.0 - 1e-6
+        assert v_c == pytest.approx(0.0, abs=1e-6) or v_c >= 150.0 - 1e-6
+        # and the post-solve-prune rule would have changed the answer
+        assert sum(out.volumes) == pytest.approx(1000.0, abs=1e-6)
+
+
+def test_minimum_run_lexicographic_tie_break():
+    # Three identical gated sources (gate 40), V = 100.  Feasible cost-tied
+    # allocations need every used source at >=40; the id-ascending lex-min is
+    # A=0, B=40, C=60 (C capped at 60).
+    sources = [
+        src("C", 60, 1.0, minimum_run_volume=40.0),
+        src("A", 100, 1.0, minimum_run_volume=40.0),
+        src("B", 100, 1.0, minimum_run_volume=40.0),
+    ]
+    out = solve_blend(sources, 100, {})
+    assert out.status == "optimal"
+    vols = dict(zip(["A", "B", "C"], out.volumes))
+    assert vols["A"] == pytest.approx(0.0, abs=1e-6)
+    assert vols["B"] == pytest.approx(40.0, abs=1e-6)
+    assert vols["C"] == pytest.approx(60.0, abs=1e-6)
+
+
+def test_minimum_active_sources_requires_threshold_sources():
+    # Only B and C carry a gate; A has none and must not count toward the
+    # minimum.  min_active=2 forces both B and C above their gates.
+    sources = [
+        src("A", 100, 1.0),
+        src("B", 100, 1.0, minimum_run_volume=40.0),
+        src("C", 60, 1.0, minimum_run_volume=40.0),
+    ]
+    out = solve_blend(sources, 100, {}, min_active=2)
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([0.0, 40.0, 60.0], abs=1e-6)
+
+    # min_active=3 cannot be met: only two gated sources exist -> infeasible,
+    # reported on the SAME constrained feasible set (nothing assemblable).
+    bad = solve_blend(sources, 100, {}, min_active=3)
+    assert bad.status == "infeasible"
+    assert bad.achievable_ranges["volume"]["max"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_minimum_active_zero_is_noop():
+    sources = [
+        src("A", 100, 1.0, minimum_run_volume=90.0),
+        src("B", 100, 1.0, minimum_run_volume=90.0),
+    ]
+    out = solve_blend(sources, 100, {}, min_active=0)
+    assert out.status == "optimal"
+    # one source alone covers 100 (>= its gate); the other stays at 0
+    assert sorted(out.volumes) == pytest.approx([0.0, 100.0], abs=1e-6)
+
+
+def test_minimum_run_combined_with_batch_size():
+    # B comes in 300 m3 batches with a 450 m3 gate: usable B in
+    # {0, 600, 900, ...}.  Calcium window [70, 100] excludes B=600
+    # (calcium 52), so B is forced to 0 and A covers 1000.
+    sources = [
+        src("A", 1000, 2.0, ca=100.0),
+        src("B", 1000, 1.0, ca=20.0, batch_size=300.0,
+            minimum_run_volume=450.0),
+    ]
+    out = solve_blend(sources, 1000, {"calcium": (70.0, 100.0)})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([1000.0, 0.0], abs=1e-6)
+
+    # Wider window: MIP picks B=600 (2 batches, satisfies both lattice and
+    # gate) with A=400.
+    ok = solve_blend(sources, 1000, {"calcium": (40.0, 100.0)})
+    assert ok.status == "optimal"
+    assert ok.volumes == pytest.approx([400.0, 600.0], abs=1e-6)
+
+
+def test_minimum_run_infeasible_ranges_honor_gate():
+    # Gate keeps B in {0} U [800, 1000]; with A capped at 800 the discrete
+    # feasible set spans calcium [20, 36], not the continuous [20, 44].
+    sources = [
+        src("A", 800, 2.0, ca=100.0),
+        src("B", 1000, 1.0, ca=20.0, minimum_run_volume=800.0),
+    ]
+    out = solve_blend(sources, 1000, {"calcium": (40.0, 60.0)})
+    assert out.status == "infeasible"
+    ca = out.achievable_ranges["calcium"]
+    assert ca["min"] == pytest.approx(20.0, abs=1e-6)
+    assert ca["max"] == pytest.approx(36.0, abs=1e-6)
+    assert ca["requested_min"] == 40.0
+    assert "volume" not in out.achievable_ranges
+    assert "calcium" in out.message
+
+
+def test_minimum_active_count_infeasible_ranges():
+    # Two gated sources (gate 60), V = 100, min_active=2: no allocation
+    # exists (120 > 100); the projection feasible set is empty.
+    sources = [
+        src("A", 100, 1.0, minimum_run_volume=60.0),
+        src("B", 100, 1.0, minimum_run_volume=60.0),
+    ]
+    out = solve_blend(sources, 100, {}, min_active=2)
+    assert out.status == "infeasible"
+    assert out.achievable_ranges["volume"]["max"] == pytest.approx(0.0, abs=1e-9)
+    assert "source-activation" in out.message
+
+
+# --------------------------------------------------------------------------- #
+# contingencies with minimum_run_volume / minimum_active_sources
+# --------------------------------------------------------------------------- #
+
+def test_contingency_preserves_minimum_run():
+    # Original (A=0, B=40, C=60) with gates 40, min_active=2 and C capped at
+    # 60.  Cutting C to 20 deactivates it; the count constraint forces A on at
+    # >=40: minimum-change solution is A=40, B=60, C=0 (change 120).
+    sources = [
+        src("A", 100, 1.0, minimum_run_volume=40.0),
+        src("B", 100, 1.0, minimum_run_volume=40.0),
+        src("C", 100, 1.0, minimum_run_volume=40.0),
+    ]
+    cont = solve_contingency(
+        sources, 100, {},
+        {"A": 0.0, "B": 40.0, "C": 60.0}, {"C": 20.0}, min_active=2,
+    )
+    assert cont.status == "optimal"
+    assert cont.volumes == pytest.approx([40.0, 60.0, 0.0], abs=1e-6)
+    assert cont.deltas == pytest.approx([40.0, 20.0, -60.0], abs=1e-6)
+    assert cont.total_adjustment == pytest.approx(120.0, abs=1e-6)
+    assert cont.cost_delta == pytest.approx(0.0, abs=1e-6)
+
+
+def test_contingency_gate_forces_zero_under_reduced_cap():
+    # Original (1000, 0); A cut to 800.  B's gate is 800, so any blend with
+    # B in (0, 200] is forbidden; calcium window [40,100] rules B>=800 out ->
+    # infeasible, and the reported calcium maximum is 36 on the SAME set.
+    sources = [
+        src("A", 1000, 2.0, ca=100.0),
+        src("B", 1000, 1.0, ca=20.0, minimum_run_volume=800.0),
+    ]
+    cont = solve_contingency(
+        sources, 1000, {"calcium": (40.0, 100.0)},
+        {"A": 1000.0, "B": 0.0}, {"A": 800.0},
+    )
+    assert cont.status == "infeasible"
+    assert cont.achievable_ranges["calcium"]["max"] == pytest.approx(36.0, abs=1e-6)
+    assert "calcium" in cont.message
+
+
+def test_contingency_count_infeasible_under_reduced_caps():
+    # min_active=2 with three gated sources (gate 40); cutting two of them to
+    # 20 leaves at most one activatable source -> infeasible.
+    sources = [
+        src("A", 100, 1.0, minimum_run_volume=40.0),
+        src("B", 100, 1.0, minimum_run_volume=40.0),
+        src("C", 100, 1.0, minimum_run_volume=40.0),
+    ]
+    cont = solve_contingency(
+        sources, 100, {},
+        {"A": 0.0, "B": 60.0, "C": 40.0}, {"B": 20.0, "C": 20.0},
+        min_active=2,
+    )
+    assert cont.status == "infeasible"
+    assert cont.achievable_ranges["volume"]["max"] == pytest.approx(0.0, abs=1e-9)
